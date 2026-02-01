@@ -6,6 +6,25 @@ See `setup.sh`.
 
 **NOTE**: Do NOT run `setup.sh` directly. Read the file, choose the configurtion for your envirnoment, and execute the relevant commands manually.
 
+## Semantic Tube Prediction{#stp}
+
+The fine-tuning script is in `stp.py`. A convenient driver script, `run_stp.sh`, provides `run_regular()` for standard fine-tuning, and `run_stp_jepa()` for Semantic Tupe Prediction fine-tuning.
+
+General flags:
+
+*   `--linear=random_span` for Semantic Tube Prediction.
+*   `--linear_predictor` for training a linear predictor.
+
+Ablation study flags:
+
+*   `--linear=e2e` for Two View in ablation study.
+*   `--random_span_mask` and `--random_span_mask_recover` for Mask in ablation study.
+*   `--linear=curvature` for Curvature in ablation study.
+
+Other flags are documented in `stp.py`.
+
+`run_stp_jepa()` will ignore `predictors`.
+
 ## LLM-JEPA Fine-tuning
 
 The fine-tuning script is in `finetune.py`. A convenient driver script, `run.sh`, provides `run_regular()` for standard fine-tuning, and `run_jepa()` for LLM-JEPA fine-tuning.
