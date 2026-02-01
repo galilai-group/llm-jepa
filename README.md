@@ -6,7 +6,7 @@ See `setup.sh`.
 
 **NOTE**: Do NOT run `setup.sh` directly. Read the file, choose the configurtion for your envirnoment, and execute the relevant commands manually.
 
-## Semantic Tube Prediction{#stp}
+## Semantic Tube Prediction {#stp}
 
 The fine-tuning script is in `stp.py`. A convenient driver script, `run_stp.sh`, provides `run_regular()` for standard fine-tuning, and `run_stp_jepa()` for Semantic Tupe Prediction fine-tuning.
 
