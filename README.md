@@ -4,7 +4,7 @@
 
 See `setup.sh`.
 
-**NOTE**: Do NOT run `setup.sh` directly. Read the file, choose the configurtion for your envirnoment, and execute the relevant commands manually.
+**NOTE**: Do NOT run `setup.sh` directly. Read the file, choose the configuration for your envirnoment, and execute the relevant commands manually.
 
 <a id="stp"></a>
 ## Semantic Tube Prediction
