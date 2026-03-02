@@ -1,0 +1,41 @@
+# Secrets & environment
+.env
+
+# Logs
+*.log
+
+# Fine-tuned model artifacts
+fine-tuned/
+
+# Experiment results
+results/
+
+# Weights & Biases runs
+wandb/
+
+# Downloaded / generated data files in root
+gsm8k_test.jsonl
+spider_data.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
