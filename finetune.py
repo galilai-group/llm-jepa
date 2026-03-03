@@ -829,41 +829,53 @@ class EvalAccuracyCallback(TrainerCallback):
         return self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
     def on_epoch_end(self, args, state, control, model=None, **kwargs):
-        if torch.cuda.current_device() == 0 and model is not None:
+        if model is not None:
             eval_model = model.module if hasattr(model, "module") else model
             eval_model.eval()
             old_use_cache = getattr(eval_model.config, "use_cache", False)
             eval_model.config.use_cache = True
 
-            correct = 0
-            total = len(self.eval_examples)
+            rank = torch.cuda.current_device()
+            world_size = int(os.environ.get('WORLD_SIZE', 1))
+            my_examples = self.eval_examples[rank::world_size]
+
+            local_correct = 0
             table_rows = []
-            for example in tqdm(self.eval_examples, desc="Eval generation", disable=False):
+            for example in tqdm(my_examples, desc=f"Eval generation (rank {rank})", disable=(rank != 0)):
                 messages = example["messages"]
                 prompt = self._format_prompt(messages)
                 generated = self._generate(eval_model, prompt)
                 is_correct = _eval_generated(generated, messages, self.input_file)
                 if is_correct:
-                    correct += 1
+                    local_correct += 1
                 table_rows.append([messages[1]["content"], messages[2]["content"], generated, is_correct])
-
-            accuracy = correct / total if total > 0 else 0.0
-            epoch = int(state.epoch)
-            print(f"Eval accuracy (epoch {epoch}): {accuracy:.4f} ({correct}/{total})")
-
-            try:
-                import wandb
-                if wandb.run is not None:
-                    table = wandb.Table(
-                        columns=["input", "ground_truth", "prediction", "correct"],
-                        data=table_rows,
-                    )
-                    wandb.log({"eval/accuracy": accuracy, "eval/correct": correct, "eval/total": total, "eval/predictions": table})
-            except ImportError:
-                pass
 
             eval_model.config.use_cache = old_use_cache
             eval_model.train()
+
+            if torch.distributed.is_initialized():
+                correct_tensor = torch.tensor(local_correct, device=f"cuda:{rank}")
+                torch.distributed.all_reduce(correct_tensor)
+                correct = correct_tensor.item()
+            else:
+                correct = local_correct
+
+            total = len(self.eval_examples)
+            accuracy = correct / total if total > 0 else 0.0
+
+            if rank == 0:
+                epoch = int(state.epoch)
+                print(f"Eval accuracy (epoch {epoch}): {accuracy:.4f} ({correct}/{total})")
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        table = wandb.Table(
+                            columns=["input", "ground_truth", "prediction", "correct"],
+                            data=table_rows,
+                        )
+                        wandb.log({"eval/accuracy": accuracy, "eval/correct": correct, "eval/total": total, "eval/predictions": table})
+                except ImportError:
+                    pass
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -948,7 +960,8 @@ def main():
         if torch.cuda.current_device() == 0:
             print(f"Running with torchrun: world_size={world_size}, local_rank={local_rank}")
         # Initialize distributed training
-        torch.distributed.init_process_group(backend='nccl')
+        import datetime
+        torch.distributed.init_process_group(backend='nccl', timeout=datetime.timedelta(minutes=30))
         torch.cuda.set_device(local_rank)
 
     if args.wandb and local_rank == 0:
