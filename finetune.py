@@ -830,53 +830,69 @@ class EvalAccuracyCallback(TrainerCallback):
         generated_tokens = outputs[0][len(inputs["input_ids"][0]):]
         return self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-    def _run_eval(self, state, model):
-        if torch.cuda.current_device() != 0 or model is None:
-            return
-        eval_model = model.module if hasattr(model, "module") else model
-        eval_model.eval()
-        old_use_cache = getattr(eval_model.config, "use_cache", False)
-        eval_model.config.use_cache = True
+    def _run_eval(self, state, model, label="epoch"):
+        if model is not None:
+            eval_model = model.module if hasattr(model, "module") else model
+            eval_model.eval()
+            old_use_cache = getattr(eval_model.config, "use_cache", False)
+            eval_model.config.use_cache = True
 
-        correct = 0
-        total = len(self.eval_examples)
-        table_rows = []
-        for example in tqdm(self.eval_examples, desc="Eval generation", disable=False):
-            messages = example["messages"]
-            prompt = self._format_prompt(messages)
-            generated = self._generate(eval_model, prompt)
-            is_correct = _eval_generated(generated, messages, self.input_file)
-            if is_correct:
-                correct += 1
-            table_rows.append([messages[1]["content"], messages[2]["content"], generated, is_correct])
+            rank = torch.cuda.current_device()
+            world_size = int(os.environ.get('WORLD_SIZE', 1))
+            my_examples = self.eval_examples[rank::world_size]
 
-        accuracy = correct / total if total > 0 else 0.0
-        print(f"Eval accuracy (step {state.global_step}): {accuracy:.4f} ({correct}/{total})")
+            local_correct = 0
+            table_rows = []
+            for example in tqdm(my_examples, desc=f"Eval generation (rank {rank})", disable=(rank != 0)):
+                messages = example["messages"]
+                prompt = self._format_prompt(messages)
+                generated = self._generate(eval_model, prompt)
+                is_correct = _eval_generated(generated, messages, self.input_file)
+                if is_correct:
+                    local_correct += 1
+                table_rows.append([messages[1]["content"], messages[2]["content"], generated, is_correct])
 
-        try:
-            import wandb
-            if wandb.run is not None:
-                table = wandb.Table(
-                    columns=["input", "ground_truth", "prediction", "correct"],
-                    data=table_rows,
-                )
-                wandb.log({"eval/accuracy": accuracy, "eval/correct": correct,
-                           "eval/total": total, "eval/predictions": table},
-                          step=state.global_step)
-        except ImportError:
-            pass
+            eval_model.config.use_cache = old_use_cache
+            eval_model.train()
 
-        eval_model.config.use_cache = old_use_cache
-        eval_model.train()
+            if torch.distributed.is_initialized():
+                correct_tensor = torch.tensor(local_correct, device=f"cuda:{rank}")
+                torch.distributed.all_reduce(correct_tensor)
+                correct = correct_tensor.item()
+            else:
+                correct = local_correct
+
+            total = len(self.eval_examples)
+            accuracy = correct / total if total > 0 else 0.0
+
+            if rank == 0:
+                print(f"Eval accuracy ({label} step={state.global_step}): {accuracy:.4f} ({correct}/{total})")
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        table = wandb.Table(
+                            columns=["input", "ground_truth", "prediction", "correct"],
+                            data=table_rows,
+                        )
+                        wandb.log({"eval/accuracy": accuracy, "eval/correct": correct,
+                                   "eval/total": total, "eval/predictions": table},
+                                  step=state.global_step)
+                except ImportError:
+                    pass
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        self._run_eval(state, model, label="step")
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if self.eval_steps and state.global_step % self.eval_steps == 0:
-            self._run_eval(state, model)
+            self._run_eval(state, model, label="step")
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
 
     def on_epoch_end(self, args, state, control, model=None, **kwargs):
-        self._run_eval(state, model)
+        self._run_eval(state, model, label="epoch")
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -961,7 +977,8 @@ def main():
         if torch.cuda.current_device() == 0:
             print(f"Running with torchrun: world_size={world_size}, local_rank={local_rank}")
         # Initialize distributed training
-        torch.distributed.init_process_group(backend='nccl')
+        import datetime
+        torch.distributed.init_process_group(backend='nccl', timeout=datetime.timedelta(minutes=30))
         torch.cuda.set_device(local_rank)
 
     if args.wandb and local_rank == 0:
@@ -1032,6 +1049,20 @@ def main():
                 args.max_length, regular=args.regular,
                 debug=args.debug, train_all=args.train_all, plain=args.plain,
                 front_pred=args.front_pred, reverse_pred=args.reverse_pred)
+        elif args.eval_accuracy and eval_raw_examples:
+            eval_split_file = args.train_file + '.eval_split.jsonl'
+            with open(eval_split_file, 'w') as f:
+                for ex in eval_raw_examples:
+                    f.write(json.dumps(ex) + '\n')
+            eval_dataset = load_and_prepare_dataset(
+                eval_split_file, tokenizer, args.model_name,
+                args.max_length, regular=args.regular,
+                debug=args.debug, train_all=args.train_all, plain=args.plain,
+                front_pred=args.front_pred, reverse_pred=args.reverse_pred)
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                os.remove(eval_split_file)
+            if torch.cuda.current_device() == 0:
+                print(f"Using {len(eval_raw_examples)} eval examples for loss calculation")
         else:
             eval_dataset = None
             if torch.cuda.current_device() == 0:
