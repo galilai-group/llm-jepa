@@ -926,8 +926,6 @@ class EvalAccuracyCallback(TrainerCallback):
                     pass
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if self.trainer is not None and hasattr(self.trainer, 'evaluate'):
-            self.trainer.evaluate()
         self._run_eval(state, model, label="start")
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -1168,7 +1166,7 @@ def main():
 
         # Training parameters
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_epochs,
