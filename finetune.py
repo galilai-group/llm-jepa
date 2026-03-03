@@ -795,14 +795,12 @@ def _eval_generated(generated, messages, input_file):
 class EvalAccuracyCallback(TrainerCallback):
     """Generation-based eval at end of each epoch and/or every N steps, logs accuracy to W&B."""
 
-    def __init__(self, eval_examples, tokenizer, model_name, input_file, max_new_tokens=512,
-                 eval_steps=None):
+    def __init__(self, eval_examples, tokenizer, model_name, input_file, max_new_tokens=512):
         self.eval_examples = eval_examples
         self.tokenizer = tokenizer
         self.model_name = model_name
         self.input_file = input_file
         self.max_new_tokens = max_new_tokens
-        self.eval_steps = eval_steps
         self.chat_template_kwargs = {}
         if "Qwen3" in model_name:
             self.chat_template_kwargs["enable_thinking"] = False
@@ -885,12 +883,6 @@ class EvalAccuracyCallback(TrainerCallback):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if self.eval_steps and state.global_step % self.eval_steps == 0:
-            self._run_eval(state, model, label="step")
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-
     def on_epoch_end(self, args, state, control, model=None, **kwargs):
         self._run_eval(state, model, label="epoch")
         if torch.distributed.is_initialized():
@@ -940,7 +932,6 @@ def main():
     parser.add_argument("--eval_accuracy", action="store_true", help="Run generation-based eval at end of each epoch (splits 20%% from train data).")
     parser.add_argument("--max_new_tokens_eval", type=int, default=256, help="Max new tokens for eval generation.")
     parser.add_argument("--max_eval_samples", type=int, default=50, help="Max samples for generation-based eval (0=all).")
-    parser.add_argument("--eval_accuracy_steps", type=int, default=None, help="Also run generation-based eval every N steps (in addition to epoch-end eval). None = epoch-end only.")
 
     args = parser.parse_args()
     
@@ -1184,8 +1175,7 @@ def main():
         eval_subset = eval_raw_examples[:args.max_eval_samples] if args.max_eval_samples > 0 else eval_raw_examples
         callbacks.append(EvalAccuracyCallback(
             eval_subset, tokenizer, args.model_name,
-            args.train_file, max_new_tokens=args.max_new_tokens_eval,
-            eval_steps=args.eval_accuracy_steps))
+            args.train_file, max_new_tokens=args.max_new_tokens_eval))
 
     # Initialize trainer
     if args.regular:
