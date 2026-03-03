@@ -281,21 +281,26 @@ def load_model_and_tokenizer(model_name, original_model_name, load_in_8bit=False
 #     return apply_chat_template_llama3_eval
 
 
-def format_conversation(messages, tokenizer, include_assistant=False, plain=False, similarity=False):
+def format_conversation(messages, tokenizer, include_assistant=False, plain=False, similarity=False, model_name=""):
     """Format conversation for the model"""
     # Filter out assistant messages if we're generating them
     if not include_assistant:
         messages = [msg for msg in messages if msg['role'] != 'assistant']
 
+    chat_template_kwargs = {}
+    if "Qwen3" in model_name:
+        chat_template_kwargs["enable_thinking"] = False
+
     # Use chat template if available
-    if plain:        
+    if plain:
         if similarity:
             formatted_text = messages[0]["content"]
         else:
             formatted_text = messages[1]["content"] + "<|perception|>"
     else:
         formatted_text = tokenizer.apply_chat_template(messages, tokenize=False,
-                                                       add_generation_prompt=True)
+                                                       add_generation_prompt=True,
+                                                       **chat_template_kwargs)
 
     return formatted_text
 
@@ -579,10 +584,10 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
 
                 if similarity:
                     input = get_user_messages(original_model_name, messages)
-                    input_prompt = format_conversation(input, tokenizer, similarity=similarity, plain=plain)
+                    input_prompt = format_conversation(input, tokenizer, similarity=similarity, plain=plain, model_name=original_model_name)
                     input_embedding = get_sequence_embedding(model, tokenizer, input_prompt, generation_config, layer=layer, pooling=pooling)
                     output = get_assistant_messages(original_model_name, messages)
-                    output_prompt = format_conversation(output, tokenizer, include_assistant=True, similarity=similarity, plain=plain)
+                    output_prompt = format_conversation(output, tokenizer, include_assistant=True, similarity=similarity, plain=plain, model_name=original_model_name)
                     output_embedding = get_sequence_embedding(model, tokenizer, output_prompt, generation_config, layer=layer, pooling=pooling)
 
                     if debug == 3:
@@ -616,7 +621,7 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
 
                 if split_tune_untune:
                     full_messages = get_messages(original_model_name, messages)
-                    prompt = format_conversation(full_messages, tokenizer, plain=plain)
+                    prompt = format_conversation(full_messages, tokenizer, plain=plain, model_name=original_model_name)
                     if "hellaswag" in os.path.basename(input_file):
                         generated_response = relative_probability(model, tokenizer, prompt, max_length=generation_config.max_new_tokens)
                         if debug == 6:

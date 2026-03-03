@@ -86,6 +86,10 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
         assistant_attention_mask_list = []
         assistant_start_end_list = []
 
+        chat_template_kwargs = {}
+        if "Qwen3" in model_name:
+            chat_template_kwargs["enable_thinking"] = False
+
         for msg_idx, messages in enumerate(examples['messages']):
             # Apply chat template if available, otherwise format manually
             full_messages = get_messages(model_name, messages)
@@ -99,6 +103,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                     full_messages,
                     tokenize=False,
                     add_generation_prompt=False,
+                    **chat_template_kwargs,
                 )
             
             # Tokenize the formatted conversation with padding to max_length
@@ -150,6 +155,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                     user_messages,
                     tokenize=False,
                     add_generation_prompt=False,
+                    **chat_template_kwargs,
                 )
             tokenized_user = tokenizer(
                 formatted_chat_user,
@@ -188,6 +194,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                     assistant_messages,
                     tokenize=False,
                     add_generation_prompt=False,
+                    **chat_template_kwargs,
                 )
             tokenized_assistant = tokenizer(
                 formatted_chat_assistant,
