@@ -23,8 +23,8 @@ import random
 import re
 import signal
 import time
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import dataclass, asdict
+from typing import Any, Optional
 
 from tqdm import tqdm
 
@@ -83,6 +83,7 @@ class PairResult:
     cell_match: float
     shape_match: bool
     error: Optional[str] = None
+    predicted: Any = None  # list[list[int]] for a valid grid, str repr for other returns, None on error
 
 
 @dataclass
@@ -159,6 +160,28 @@ def parse_plan(generated_text: str) -> str:
     return plan_str.strip()
 
 
+def _coerce_predicted(value) -> Any:
+    """Best-effort conversion of `solve()`'s return into a list-of-lists-of-ints.
+
+    Returns the grid if it looks well-formed; otherwise a short repr so the model
+    can see what it produced (e.g. `None`, a string, a numpy array).
+    """
+    try:
+        rows = [list(row) for row in value]
+    except TypeError:
+        try:
+            return repr(value)[:200]
+        except Exception:
+            return "<unreprable>"
+    try:
+        return [[int(c) for c in row] for row in rows]
+    except (TypeError, ValueError):
+        try:
+            return repr(value)[:200]
+        except Exception:
+            return "<unreprable>"
+
+
 def _cell_match_ratio(predicted, expected) -> tuple[float, bool]:
     """Return (match_ratio, shape_match). Ratio is 0.0 on shape mismatch."""
     try:
@@ -197,7 +220,7 @@ def _pairs_have_outputs(pairs: list) -> bool:
     return all("output" in pair for pair in pairs)
 
 
-def evaluate_program(code_str: str, train_pairs: list, timeout: int = 5) -> ScoreResult:
+def evaluate_program(code_str: str, train_pairs: list, timeout: int = 2) -> ScoreResult:
     """Exec the program, run solve() on every train pair, return per-pair results and aggregate score.
 
     Unlike the baseline `evaluate_solution` in evaluate_finetuned.py, this does not short-circuit on
@@ -241,7 +264,7 @@ def evaluate_program(code_str: str, train_pairs: list, timeout: int = 5) -> Scor
 
         ratio, shape_ok = _cell_match_ratio(predicted, expected)
         exact = shape_ok and ratio == 1.0
-        per_pair.append(PairResult(exact, ratio, shape_ok, None))
+        per_pair.append(PairResult(exact, ratio, shape_ok, None, _coerce_predicted(predicted)))
 
     pass_count = sum(1 for p in per_pair if p.exact)
     avg_cell = (sum(p.cell_match for p in per_pair) / len(per_pair)) if per_pair else 0.0
@@ -341,6 +364,12 @@ def _format_grid(grid) -> str:
     return "\n".join(" ".join(str(c) for c in row) for row in grid)
 
 
+def _format_grid_block(label: str, grid, indent: int = 4) -> str:
+    prefix = " " * indent
+    body = "\n".join(f"{prefix}  {line}" for line in _format_grid(grid).split("\n"))
+    return f"{prefix}{label}:\n{body}"
+
+
 def _format_train_pairs(train_pairs: list) -> str:
     lines = []
     for i, pair in enumerate(train_pairs):
@@ -363,12 +392,19 @@ def _format_pair_feedback(score: ScoreResult) -> str:
     for i, p in enumerate(score.per_pair):
         if p["error"]:
             lines.append(f"  Pair {i + 1}: EXCEPTION — {p['error']}")
-        elif p["exact"]:
+            continue
+        if p["exact"]:
             lines.append(f"  Pair {i + 1}: EXACT match")
-        elif not p["shape_match"]:
+            continue
+        if not p["shape_match"]:
             lines.append(f"  Pair {i + 1}: wrong output shape")
         else:
             lines.append(f"  Pair {i + 1}: shape OK, {p['cell_match'] * 100:.1f}% cells correct")
+        predicted = p.get("predicted")
+        if isinstance(predicted, list) and predicted and isinstance(predicted[0], list):
+            lines.append(_format_grid_block("Got", predicted, indent=4))
+        elif isinstance(predicted, str):
+            lines.append(f"    Got (non-grid): {predicted}")
     return "\n".join(lines)
 
 
@@ -492,6 +528,35 @@ class Proposer:
         outputs = llm.generate(prompts, params, use_tqdm=False)
         return [o.outputs[0].text for o in outputs]
 
+    def warm_start(self, train_pairs: list, num_samples: int) -> list[str]:
+        """Generate a handful of from-scratch seed programs to avoid starting from identity.
+
+        Uses the full-rewrite prompt with `parent=None`. Returns unique, non-empty programs
+        that contain a `def solve` definition.
+        """
+        if num_samples <= 0:
+            return []
+        prompt = build_full_prompt(self.coder_tokenizer, train_pairs, parent=None)
+        outputs = self._generate(
+            self.coder_llm,
+            [prompt] * num_samples,
+            stop=["</solution>"],
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+        )
+        seen: set[str] = set()
+        programs: list[str] = []
+        for text in outputs:
+            code = parse_code(text)
+            if not code or "def solve" not in code:
+                continue
+            key = code.strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            programs.append(code)
+        return programs
+
     def propose(
         self,
         train_pairs: list,
@@ -587,26 +652,63 @@ def evolve_task(
     timeout: int,
     top_k_parents: int,
     rng: random.Random,
+    warm_start_samples: int = 0,
+    scorer=None,
+    jepa_predictor: bool = False,
+    jepa_steering: bool = False,
+    jepa_oversample: int = 3,
+    jepa_prior_weight: float = 0.01,
+    jepa_behavioral_weight: float = 0.01,
+    jepa_exploration_reserve: float = 0.25,
     verbose: bool = False,
 ) -> dict:
     train_pairs = task_data["train"]
     db = ProgramDatabase(top_k_parents=top_k_parents)
 
-    # Seed: identity program
-    seed_score = evaluate_program(SEED_PROGRAM, train_pairs, timeout=timeout)
-    db.add(
-        program=SEED_PROGRAM,
-        score=seed_score.score,
-        pass_count=seed_score.pass_count,
-        avg_cell_match=seed_score.avg_cell_match,
-        solved=seed_score.solved,
-        num_pairs=seed_score.num_pairs,
-        per_pair=seed_score.per_pair,
-        compile_error=seed_score.compile_error,
-        parent_id=None,
-        iteration=-1,
-        origin="seed",
-    )
+    if scorer is not None and (jepa_predictor or jepa_steering):
+        scorer.begin_task(train_pairs)
+
+    def _predicted_grids(result):
+        grids = []
+        for p in result.per_pair:
+            pred = p.get("predicted")
+            if isinstance(pred, list) and pred and isinstance(pred[0], list):
+                grids.append(pred)
+            else:
+                return None
+        return grids if len(grids) == len(train_pairs) else None
+
+    def _final_score(code, result):
+        if scorer is None or not jepa_predictor:
+            return result.score
+        from jepa import compose_score
+        behavioral, prior = scorer.score(code, _predicted_grids(result))
+        return compose_score(result.pass_count, prior, behavioral,
+                             jepa_prior_weight, jepa_behavioral_weight)
+
+    # Seeds: identity + any warm-start programs from the coder.
+    seed_items: list[tuple[str, str]] = [(SEED_PROGRAM, "seed")]
+    if warm_start_samples > 0:
+        for code in proposer.warm_start(train_pairs, warm_start_samples):
+            seed_items.append((code, "warm_start"))
+
+    for code, origin in seed_items:
+        if db.contains(code):
+            continue
+        result = evaluate_program(code, train_pairs, timeout=timeout)
+        db.add(
+            program=code,
+            score=_final_score(code, result),
+            pass_count=result.pass_count,
+            avg_cell_match=result.avg_cell_match,
+            solved=result.solved,
+            num_pairs=result.num_pairs,
+            per_pair=result.per_pair,
+            compile_error=result.compile_error,
+            parent_id=None,
+            iteration=-1,
+            origin=origin,
+        )
 
     score_history = [(0, db.best().score, db.best().pass_count)]
 
@@ -615,15 +717,25 @@ def evolve_task(
             break
 
         parents = [db.sample_parent(rng) for _ in range(parallel_parents)]
-        children = proposer.propose(train_pairs, parents, batch_size_per_parent=batch_size)
+        if scorer is not None and jepa_steering:
+            children = proposer.propose(
+                train_pairs, parents, batch_size_per_parent=batch_size * jepa_oversample
+            )
+            keep_n = batch_size * len(parents)
+            children = scorer.rerank(children, keep_n, jepa_exploration_reserve, rng)
+        else:
+            children = proposer.propose(train_pairs, parents, batch_size_per_parent=batch_size)
 
+        seen_in_batch: set[str] = set()
         for child_program, parent, origin in children:
-            if db.contains(child_program):
+            key = child_program.strip()
+            if db.contains(child_program) or key in seen_in_batch:
                 continue
+            seen_in_batch.add(key)
             result = evaluate_program(child_program, train_pairs, timeout=timeout)
             db.add(
                 program=child_program,
-                score=result.score,
+                score=_final_score(child_program, result),
                 pass_count=result.pass_count,
                 avg_cell_match=result.avg_cell_match,
                 solved=result.solved,
@@ -690,16 +802,35 @@ def main():
     parser.add_argument("--top_k_parents", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=5)
     parser.add_argument("--max_model_len", type=int, default=None)
+    parser.add_argument("--warm_start_samples", type=int, default=4, help="Coder-generated seed programs per task (0 disables)")
+    parser.add_argument("--no_prefix_cache", action="store_true", help="Disable vLLM prefix caching")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=str, default="evolve_results.jsonl")
     parser.add_argument("--wandb_project", type=str, default="arc-evolve")
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--llm_jepa_model", type=str, default=None,
+                        help="Unified LLM-JEPA model (coder generation + embedding source)")
+    parser.add_argument("--llm_jepa_base_model", type=str, default=None,
+                        help="Base weights when --llm_jepa_model is an unmerged LoRA adapter")
+    parser.add_argument("--jepa_predictor", action="store_true",
+                        help="Fold JEPA behavioral+prior cosines into fitness (requires --llm_jepa_model)")
+    parser.add_argument("--jepa_steering", action="store_true",
+                        help="Rerank oversampled children toward Pred(Enc(task)) (requires --llm_jepa_model)")
+    parser.add_argument("--jepa_pred_token", type=str, default="[PRED]")
+    parser.add_argument("--jepa_embed_layer", type=int, default=-1)
+    parser.add_argument("--jepa_oversample", type=int, default=3)
+    parser.add_argument("--jepa_prior_weight", type=float, default=0.01)
+    parser.add_argument("--jepa_behavioral_weight", type=float, default=0.01)
+    parser.add_argument("--jepa_exploration_reserve", type=float, default=0.25)
     args = parser.parse_args()
 
-    coder_model = args.coder_model or args.merged_model
+    if (args.jepa_predictor or args.jepa_steering) and not args.llm_jepa_model:
+        parser.error("--jepa_predictor/--jepa_steering require --llm_jepa_model.")
+
+    coder_model = args.coder_model or args.merged_model or args.llm_jepa_model
     if not coder_model:
-        parser.error("Provide --coder_model (or legacy --merged_model).")
+        parser.error("Provide --coder_model (or --llm_jepa_model / legacy --merged_model).")
 
     rng = random.Random(args.seed)
 
@@ -719,6 +850,7 @@ def main():
         dtype="bfloat16",
         tokenizer=coder_model,
         max_model_len=args.max_model_len,
+        enable_prefix_caching=not args.no_prefix_cache,
     )
 
     planner_tokenizer = None
@@ -731,6 +863,7 @@ def main():
             dtype="bfloat16",
             tokenizer=args.planner_model,
             max_model_len=args.max_model_len,
+            enable_prefix_caching=not args.no_prefix_cache,
         )
 
     proposer = Proposer(
@@ -743,6 +876,22 @@ def main():
         planner_max_new_tokens=args.planner_max_new_tokens,
         planner_temperature=args.planner_temperature,
     )
+
+    scorer = None
+    if args.jepa_predictor or args.jepa_steering:
+        from jepa import JepaLLM, JepaScorer
+        print(f"Loading LLM-JEPA embedder {args.llm_jepa_model} (HF)...")
+        jepa_llm = JepaLLM(
+            model_path=args.llm_jepa_model,
+            base_model=args.llm_jepa_base_model,
+            pred_token=args.jepa_pred_token,
+            embed_layer=args.jepa_embed_layer,
+        )
+        scorer = JepaScorer(
+            jepa_llm,
+            prior_weight=args.jepa_prior_weight,
+            behavioral_weight=args.jepa_behavioral_weight,
+        )
 
     # Load challenges / solutions
     challenge_file = f"arc-prize-2024/arc-agi_{args.eval_set}_challenges.json"
@@ -785,6 +934,14 @@ def main():
                 timeout=args.timeout,
                 top_k_parents=args.top_k_parents,
                 rng=rng,
+                warm_start_samples=args.warm_start_samples,
+                scorer=scorer,
+                jepa_predictor=args.jepa_predictor,
+                jepa_steering=args.jepa_steering,
+                jepa_oversample=args.jepa_oversample,
+                jepa_prior_weight=args.jepa_prior_weight,
+                jepa_behavioral_weight=args.jepa_behavioral_weight,
+                jepa_exploration_reserve=args.jepa_exploration_reserve,
                 verbose=args.verbose,
             )
             out.write(json.dumps(result) + "\n")
