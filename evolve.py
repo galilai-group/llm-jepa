@@ -654,9 +654,11 @@ def evolve_task(
     rng: random.Random,
     warm_start_samples: int = 0,
     scorer=None,
-    jepa_predictor: bool = False,
-    jepa_steering: bool = False,
-    jepa_oversample: int = 3,
+    jepa_prior: bool = False,
+    jepa_behavioral: bool = False,
+    jepa_prefilter: bool = False,
+    continue_past_solve: bool = False,
+    jepa_oversample: int = 1,
     jepa_prior_weight: float = 0.01,
     jepa_behavioral_weight: float = 0.01,
     jepa_exploration_reserve: float = 0.25,
@@ -665,7 +667,8 @@ def evolve_task(
     train_pairs = task_data["train"]
     db = ProgramDatabase(top_k_parents=top_k_parents)
 
-    if scorer is not None and (jepa_predictor or jepa_steering):
+    if scorer is not None:
+        from jepa import compose_score  # noqa: F401  (used by the scoring closures below)
         scorer.begin_task(train_pairs)
 
     def _predicted_grids(result):
@@ -679,12 +682,12 @@ def evolve_task(
         return grids if len(grids) == len(train_pairs) else None
 
     def _final_score(code, result):
-        if scorer is None or not jepa_predictor:
+        if scorer is None or not (jepa_prior or jepa_behavioral):
             return result.score
-        from jepa import compose_score
         behavioral, prior = scorer.score(code, _predicted_grids(result))
-        return compose_score(result.pass_count, prior, behavioral,
-                             jepa_prior_weight, jepa_behavioral_weight)
+        return compose_score(result.pass_count, result.avg_cell_match, prior, behavioral,
+                             jepa_prior_weight, jepa_behavioral_weight,
+                             use_prior=jepa_prior, use_behavioral=jepa_behavioral)
 
     # Seeds: identity + any warm-start programs from the coder.
     seed_items: list[tuple[str, str]] = [(SEED_PROGRAM, "seed")]
@@ -713,19 +716,21 @@ def evolve_task(
     score_history = [(0, db.best().score, db.best().pass_count)]
 
     for it in range(max_iterations):
-        if db.best().solved:
+        if db.best().solved and not continue_past_solve:
             break
 
         parents = [db.sample_parent(rng) for _ in range(parallel_parents)]
-        if scorer is not None and jepa_steering:
-            children = proposer.propose(
-                train_pairs, parents, batch_size_per_parent=batch_size * jepa_oversample
-            )
-            keep_n = batch_size * len(parents)
-            children = scorer.rerank(children, keep_n, jepa_exploration_reserve, rng)
-        else:
-            children = proposer.propose(train_pairs, parents, batch_size_per_parent=batch_size)
+        bsp = batch_size * jepa_oversample if jepa_oversample > 1 else batch_size
+        children = proposer.propose(train_pairs, parents, batch_size_per_parent=bsp)
 
+        # OPT-IN: cosine cull BEFORE execution. Can discard programs that would have passed the
+        # train pairs, so it is off by default; prefer executing everything (cheap) and ranking.
+        if scorer is not None and jepa_prefilter:
+            keep_n = batch_size * len(parents)
+            children = scorer.prefilter(children, keep_n, jepa_exploration_reserve, rng)
+
+        # Execute every (surviving) child -- execution is the ground truth and the cheap part.
+        evaluated = []
         seen_in_batch: set[str] = set()
         for child_program, parent, origin in children:
             key = child_program.strip()
@@ -733,9 +738,25 @@ def evolve_task(
                 continue
             seen_in_batch.add(key)
             result = evaluate_program(child_program, train_pairs, timeout=timeout)
+            evaluated.append((child_program, parent, origin, result))
+
+        # Batched JEPA scoring: at most two encode() calls for the whole generation, not 2N.
+        if scorer is not None and (jepa_prior or jepa_behavioral):
+            bp = scorer.score_many([e[0] for e in evaluated],
+                                   [_predicted_grids(e[3]) for e in evaluated])
+        else:
+            bp = [(None, None)] * len(evaluated)
+
+        for (child_program, parent, origin, result), (behavioral, prior) in zip(evaluated, bp):
+            if scorer is not None and (jepa_prior or jepa_behavioral):
+                score = compose_score(result.pass_count, result.avg_cell_match, prior, behavioral,
+                                      jepa_prior_weight, jepa_behavioral_weight,
+                                      use_prior=jepa_prior, use_behavioral=jepa_behavioral)
+            else:
+                score = result.score
             db.add(
                 program=child_program,
-                score=_final_score(child_program, result),
+                score=score,
                 pass_count=result.pass_count,
                 avg_cell_match=result.avg_cell_match,
                 solved=result.solved,
@@ -750,16 +771,30 @@ def evolve_task(
         best = db.best()
         score_history.append((it + 1, best.score, best.pass_count))
         if verbose:
+            n_solved = sum(1 for c in db.candidates if c.solved)
             print(
                 f"  [{task_id}] iter {it + 1}/{max_iterations} "
                 f"best={best.pass_count}/{best.num_pairs} "
-                f"cell={best.avg_cell_match:.3f} pop={len(db.candidates)}"
+                f"cell={best.avg_cell_match:.3f} pop={len(db.candidates)} solved={n_solved}"
             )
-        if best.solved:
+        if db.best().solved and not continue_past_solve:
             break
 
     best = db.best()
     test_score = evaluate_program(best.program, test_pairs, timeout=timeout) if _pairs_have_outputs(test_pairs) else None
+
+    # Selection-gap analysis: among ALL train-consistent candidates, does any pass the test?
+    # If oracle_test_solved is True while test_solved is False, the score picked the wrong solver --
+    # this is exactly the majority-vote-vs-oracle gap the JEPA prior is meant to close. Cheap: a
+    # handful of extra test evals (only runs when test outputs are present).
+    train_consistent = [c for c in db.candidates if c.solved]
+    oracle_test_solved = None
+    n_solver_test_pass = None
+    if _pairs_have_outputs(test_pairs):
+        passes = [evaluate_program(c.program, test_pairs, timeout=timeout).solved
+                  for c in train_consistent]
+        n_solver_test_pass = int(sum(passes))
+        oracle_test_solved = bool(any(passes))
 
     return {
         "task_id": task_id,
@@ -768,12 +803,15 @@ def evolve_task(
         "train_num_pairs": best.num_pairs,
         "train_cell_match": best.avg_cell_match,
         "train_solved": best.solved,
+        "num_train_consistent": len(train_consistent),
         "test_evaluated": test_score is not None,
         "test_pass_count": test_score.pass_count if test_score is not None else None,
         "test_num_pairs": test_score.num_pairs if test_score is not None else len(test_pairs),
         "test_solved": test_score.solved if test_score is not None else None,
         "test_cell_match": test_score.avg_cell_match if test_score is not None else None,
         "test_compile_error": test_score.compile_error if test_score is not None else None,
+        "oracle_test_solved": oracle_test_solved,
+        "n_solver_test_pass": n_solver_test_pass,
         "population_size": len(db.candidates),
         "score_history": score_history,
         "best_origin": best.origin,
@@ -810,23 +848,54 @@ def main():
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--llm_jepa_model", type=str, default=None,
-                        help="Unified LLM-JEPA model (coder generation + embedding source)")
+                        help="LLM-JEPA model: embedding source (and coder, if --coder_model unset)")
     parser.add_argument("--llm_jepa_base_model", type=str, default=None,
                         help="Base weights when --llm_jepa_model is an unmerged LoRA adapter")
+    # --- granular ablation arms (split the signals that used to be bundled) ---
+    parser.add_argument("--jepa_prior", action="store_true",
+                        help="Fold the prior cosine cos(Pred(Enc(task)), Enc(program)) into fitness")
+    parser.add_argument("--jepa_behavioral", action="store_true",
+                        help="Fold the behavioral cosine (real task vs candidate-output task) into fitness")
     parser.add_argument("--jepa_predictor", action="store_true",
-                        help="Fold JEPA behavioral+prior cosines into fitness (requires --llm_jepa_model)")
+                        help="DEPRECATED alias: enables both --jepa_prior and --jepa_behavioral")
+    parser.add_argument("--jepa_oversample", type=int, default=1,
+                        help="Generate N x children/iter (pure breadth; all are executed)")
+    parser.add_argument("--jepa_prefilter", action="store_true",
+                        help="RISKY/opt-in: cosine-cull oversampled children BEFORE execution")
     parser.add_argument("--jepa_steering", action="store_true",
-                        help="Rerank oversampled children toward Pred(Enc(task)) (requires --llm_jepa_model)")
+                        help="DEPRECATED alias for --jepa_prefilter")
+    parser.add_argument("--continue_past_solve", action="store_true",
+                        help="Keep searching after the first train-solving program so the prior can "
+                             "rank the train-consistent set (enables the oracle-gap experiment)")
+    # --- embedding backend ---
+    parser.add_argument("--jepa_backend", choices=["hf", "vllm"], default="hf",
+                        help="hf: transformers forward (verified, 2nd weight copy). "
+                             "vllm: hidden-state extraction (vllm>=0.18); auto-runs smoke_check")
+    parser.add_argument("--jepa_share_engine", action="store_true",
+                        help="vLLM backend only: reuse the coder engine for extraction (1 weight "
+                             "copy). Off-label for long-form generation; smoke_check guards it")
+    parser.add_argument("--jepa_extract_layers", type=str, default=None,
+                        help="vLLM backend only: comma-separated layer ids to extract, e.g. 16,24,31")
+    parser.add_argument("--jepa_golden_check", action="store_true",
+                        help="Run smoke_check on the embedder before the main loop and exit on fail")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=None,
+                        help="vLLM coder GPU mem fraction; lower it to leave room for an HF / "
+                             "separate-engine embedder (vLLM reserves 0.9 by default)")
     parser.add_argument("--jepa_pred_token", type=str, default="[PRED]")
     parser.add_argument("--jepa_embed_layer", type=int, default=-1)
-    parser.add_argument("--jepa_oversample", type=int, default=3)
     parser.add_argument("--jepa_prior_weight", type=float, default=0.01)
     parser.add_argument("--jepa_behavioral_weight", type=float, default=0.01)
     parser.add_argument("--jepa_exploration_reserve", type=float, default=0.25)
     args = parser.parse_args()
 
-    if (args.jepa_predictor or args.jepa_steering) and not args.llm_jepa_model:
-        parser.error("--jepa_predictor/--jepa_steering require --llm_jepa_model.")
+    # Resolve deprecated aliases into the granular flags.
+    jepa_prior = args.jepa_prior or args.jepa_predictor
+    jepa_behavioral = args.jepa_behavioral or args.jepa_predictor
+    jepa_prefilter = args.jepa_prefilter or args.jepa_steering
+    jepa_any = jepa_prior or jepa_behavioral or jepa_prefilter
+
+    if jepa_any and not args.llm_jepa_model:
+        parser.error("--jepa_prior/--jepa_behavioral/--jepa_prefilter require --llm_jepa_model.")
 
     coder_model = args.coder_model or args.merged_model or args.llm_jepa_model
     if not coder_model:
@@ -839,9 +908,30 @@ def main():
 
         wandb.init(project=args.wandb_project, config=vars(args))
 
-    # Load model
+    # Load model(s)
     from vllm import LLM
     from transformers import AutoTokenizer
+
+    # Parse extraction layers and, if we will reuse the coder engine for vLLM hidden-state
+    # extraction, build it WITH the extraction config (off-label for long-form generation; the
+    # smoke_check below guards correctness). A separate-engine vLLM embedder makes its own storage.
+    extract_layers = None
+    if args.jepa_extract_layers:
+        extract_layers = [int(x) for x in args.jepa_extract_layers.split(",") if x.strip() != ""]
+
+    jepa_storage = None
+    coder_kwargs = {}
+    if args.gpu_memory_utilization is not None:
+        coder_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+    if jepa_any and args.jepa_backend == "vllm":
+        import tempfile
+        if not extract_layers:
+            parser.error("--jepa_backend vllm needs --jepa_extract_layers (e.g. 16,24,31).")
+        jepa_storage = tempfile.mkdtemp(prefix="jepa_hs_")
+        if args.jepa_share_engine:
+            from jepa import extraction_config
+            coder_kwargs.update(extraction_config(extract_layers, jepa_storage))
+            print(f"Building coder engine WITH hidden-state extraction (layers {extract_layers}).")
 
     print(f"Loading coder model {coder_model} with vLLM...")
     coder_tokenizer = AutoTokenizer.from_pretrained(coder_model)
@@ -851,6 +941,7 @@ def main():
         tokenizer=coder_model,
         max_model_len=args.max_model_len,
         enable_prefix_caching=not args.no_prefix_cache,
+        **coder_kwargs,
     )
 
     planner_tokenizer = None
@@ -878,19 +969,36 @@ def main():
     )
 
     scorer = None
-    if args.jepa_predictor or args.jepa_steering:
-        from jepa import JepaLLM, JepaScorer
-        print(f"Loading LLM-JEPA embedder {args.llm_jepa_model} (HF)...")
-        jepa_llm = JepaLLM(
+    if jepa_any:
+        from jepa import build_embedder, JepaScorer, smoke_check
+        print(f"Loading LLM-JEPA embedder ({args.jepa_backend}) from {args.llm_jepa_model} ...")
+        embedder = build_embedder(
+            backend=args.jepa_backend,
             model_path=args.llm_jepa_model,
             base_model=args.llm_jepa_base_model,
             pred_token=args.jepa_pred_token,
             embed_layer=args.jepa_embed_layer,
+            shared_engine=coder_llm if (args.jepa_backend == "vllm" and args.jepa_share_engine) else None,
+            storage_path=jepa_storage,
+            extract_layers=extract_layers,
+            max_model_len=args.max_model_len,
         )
+        # Fail-fast verification: mandatory on the unverified vLLM path, opt-in otherwise.
+        if args.jepa_backend == "vllm" or args.jepa_golden_check:
+            ok, report = smoke_check(embedder)
+            print(f"[jepa] {report}")
+            if not ok:
+                raise SystemExit(
+                    "[jepa] smoke_check FAILED -- the embedder is degenerate (likely a mis-restored "
+                    "[PRED] row, or on the vLLM path a connector file-format mismatch in "
+                    "VllmHiddenStateEmbedder._read_states). Re-run with --jepa_backend hf to isolate."
+                )
         scorer = JepaScorer(
-            jepa_llm,
+            embedder,
             prior_weight=args.jepa_prior_weight,
             behavioral_weight=args.jepa_behavioral_weight,
+            use_prior=jepa_prior,
+            use_behavioral=jepa_behavioral,
         )
 
     # Load challenges / solutions
@@ -936,8 +1044,10 @@ def main():
                 rng=rng,
                 warm_start_samples=args.warm_start_samples,
                 scorer=scorer,
-                jepa_predictor=args.jepa_predictor,
-                jepa_steering=args.jepa_steering,
+                jepa_prior=jepa_prior,
+                jepa_behavioral=jepa_behavioral,
+                jepa_prefilter=jepa_prefilter,
+                continue_past_solve=args.continue_past_solve,
                 jepa_oversample=args.jepa_oversample,
                 jepa_prior_weight=args.jepa_prior_weight,
                 jepa_behavioral_weight=args.jepa_behavioral_weight,

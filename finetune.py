@@ -51,7 +51,7 @@ def get_assistant_messages(model_name, dataset, messages):
     #     if gt_answer:
     #         messages[2]["content"] = messages[2]["content"].replace(gt_answer, "")
 
-    if "google/gemma" in model_name:
+    if "google/gemma" in model_name or "Qwen" in model_name:
         assistant_messages = copy.deepcopy(messages)[2:3]
         assistant_messages[0]["role"] = "user"
         return assistant_messages
@@ -109,24 +109,28 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
         prompt_tokens = tokenize_chat_text(prompt_text, truncation=False)["input_ids"]
         return min(len(prompt_tokens), input_length)
 
+    def is_within_budget(example):
+        full_messages, formatted_chat = format_full_conversation(example["messages"])
+        prompt_len = len(tokenize_chat_text(
+            format_prompt_for_generation(example["messages"], full_messages=full_messages),
+            truncation=False,
+        )["input_ids"])
+        full_len = len(tokenize_chat_text(formatted_chat, truncation=False)["input_ids"])
+        # Keep only samples that fit fully and still leave room for assistant labels.
+        return full_len <= max_length and prompt_len < max_length
+
+    original_count = len(dataset)
+    dataset = dataset.filter(
+        is_within_budget,
+        num_proc=max(1, os.cpu_count() - 1) if hasattr(os, 'cpu_count') else 4,
+    )
     if torch.cuda.current_device() == 0:
-        prompt_overflow = 0
-        sample_overflow = 0
-        for example in dataset:
-            full_messages, formatted_chat = format_full_conversation(example["messages"])
-            prompt_len = len(tokenize_chat_text(
-                format_prompt_for_generation(example["messages"], full_messages=full_messages),
-                truncation=False,
-            )["input_ids"])
-            full_len = len(tokenize_chat_text(formatted_chat, truncation=False)["input_ids"])
-            if prompt_len >= max_length:
-                prompt_overflow += 1
-            if full_len > max_length:
-                sample_overflow += 1
-        if prompt_overflow or sample_overflow:
+        dropped = original_count - len(dataset)
+        if dropped:
             print(
-                f"Warning: {sample_overflow}/{len(dataset)} samples exceed max_length={max_length}; "
-                f"{prompt_overflow} have prompts that already fill the full budget, so they contribute no assistant labels."
+                f"Dropped {dropped}/{original_count} samples exceeding max_length={max_length} "
+                f"(full sequence > {max_length} tokens, or prompt alone fills the budget so no assistant labels remain). "
+                f"{len(dataset)} samples remain."
             )
     
     def tokenize_conversations(examples):
@@ -145,11 +149,11 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             # Apply chat template if available, otherwise format manually
             full_messages, formatted_chat = format_full_conversation(messages)
             
-            # Tokenize the formatted conversation with padding to max_length
+            # Tokenize the formatted conversation (no padding here; the collator pads each batch)
             tokenized = tokenize_chat_text(
                 formatted_chat,
                 truncation=True,
-                padding=True,
+                padding=False,
             )
             
             input_ids = tokenized["input_ids"]
@@ -194,7 +198,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 formatted_chat_user,
                 truncation=True,
                 max_length=max_length,
-                padding="max_length",  # Pad to max_length for consistent tensor shapes
+                padding=False,  # Collator pads per batch
                 add_special_tokens=False,
                 return_tensors=None
             )
@@ -224,7 +228,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 formatted_chat_assistant,
                 truncation=True,
                 max_length=max_length,
-                padding="max_length",  # Pad to max_length for consistent tensor shapes
+                padding=False,  # Collator pads per batch
                 add_special_tokens=False,
                 return_tensors=None
             )
@@ -252,6 +256,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 "input_ids": input_ids_list,
                 "labels": labels_list,
                 "attention_mask": attention_mask_list,
+                "length": [len(ids) for ids in input_ids_list],
             }
         else:
             return {
@@ -264,6 +269,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 "input_ids_assistant": assistant_input_ids_list,
                 "labels_assistant": assistant_labels_list,
                 "attention_mask_assistant": assistant_attention_mask_list,
+                "length": [len(ids) for ids in input_ids_list],
             }
     
     # def format_messages_manually(messages):
@@ -496,7 +502,6 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
             # attn_implementation="flash_attention_2",
             # Add these for better multi-GPU stability
             low_cpu_mem_usage=True,
-            use_cache=False,  # Disable KV cache for training
         )
 
     if new_tokens:
@@ -522,6 +527,54 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
             model.print_trainable_parameters()
     
     return model, tokenizer
+
+
+class DynamicPaddingCollator:
+    """Pad each batch to its own longest sequence instead of a fixed max_length.
+
+    Pads the main / user / assistant sequence groups to one common per-batch
+    length so the downstream torch.cat and additive-mask logic still line up.
+    When additive_mask is set, the common length is also grown to hold
+    user + assistant tokens, since the trainer splices the assistant tokens into
+    the tail of the user tensor (see build_with_additive_mask).
+    """
+
+    def __init__(self, pad_token_id, additive_mask=False, pad_to_multiple_of=64):
+        self.pad_token_id = pad_token_id
+        self.additive_mask = additive_mask
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    @staticmethod
+    def _pad(sequences, pad_value, length):
+        return [seq + [pad_value] * (length - len(seq)) for seq in sequences]
+
+    def __call__(self, features):
+        groups = [g for g in ("", "_user", "_assistant") if f"input_ids{g}" in features[0]]
+
+        target_len = max(len(f[f"input_ids{g}"]) for f in features for g in groups)
+        if self.additive_mask and "_user" in groups and "_assistant" in groups:
+            # Assistant tokens get spliced into the user tensor's tail at train
+            # time, so user/main must have room for user + assistant.
+            target_len = max(
+                target_len,
+                max(len(f["input_ids_user"]) + len(f["input_ids_assistant"]) for f in features),
+            )
+        if self.pad_to_multiple_of:
+            target_len = ((target_len + self.pad_to_multiple_of - 1)
+                          // self.pad_to_multiple_of) * self.pad_to_multiple_of
+
+        batch = {}
+        for g in groups:
+            batch[f"input_ids{g}"] = torch.tensor(
+                self._pad([f[f"input_ids{g}"] for f in features], self.pad_token_id, target_len),
+                dtype=torch.long)
+            batch[f"labels{g}"] = torch.tensor(
+                self._pad([f[f"labels{g}"] for f in features], -100, target_len),
+                dtype=torch.long)
+            batch[f"attention_mask{g}"] = torch.tensor(
+                self._pad([f[f"attention_mask{g}"] for f in features], 0, target_len),
+                dtype=torch.long)
+        return batch
 
 
 class RepresentationTrainer(Trainer):
@@ -916,11 +969,11 @@ def main():
         else:
             print("No evaluation dataset")
     
-    # Data collator - don't use padding since we already padded
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,  # We're doing causal LM, not masked LM
-        pad_to_multiple_of=None,  # We already padded to max_length
+    # Data collator - pad each batch dynamically to its longest sample
+    data_collator = DynamicPaddingCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        additive_mask=args.additive_mask,
+        pad_to_multiple_of=64,
     )
     
     # Training arguments - optimized for multi-GPU stability
@@ -970,6 +1023,7 @@ def main():
         bf16=True,
         gradient_checkpointing=True,  # Enable for memory efficiency
         dataloader_drop_last=True,   # Drop last incomplete batch
+        train_sampling_strategy="group_by_length",  # Batch similar-length samples to minimize padding (transformers 5.x; replaces group_by_length=True)
         
         # Memory optimization
         dataloader_num_workers=0,    # Avoid multiprocessing issues
