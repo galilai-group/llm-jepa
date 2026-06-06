@@ -14,6 +14,7 @@ import json
 from datasets import load_dataset
 import shutil
 from transformers import (
+    default_data_collator,
     AutoConfig,
     AutoTokenizer, 
     AutoModelForCausalLM,
@@ -61,7 +62,7 @@ def get_assistant_messages(model_name, dataset, messages):
 
 def load_and_prepare_dataset(data_file, tokenizer, model_name,
                              max_length=2048, debug=0, predictors=0, regular=False, train_all=False,
-                             plain=False, front_pred=False, reverse_pred=False):
+                             plain=False, front_pred=False, reverse_pred=False, unmask_assistant_special_tokens=False):
     """Load JSONL dataset and format for training with proper label masking"""
     
     # Load dataset
@@ -162,6 +163,8 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             # Create labels with proper masking
             if train_all:
                 labels = create_labels_for_all(input_ids, attention_mask)
+            elif unmask_assistant_special_tokens:
+                labels = create_labels_with_masked_prompt(messages, tokenizer, input_ids, attention_mask)
             else:
                 labels = create_masked_labels(messages, input_ids, attention_mask, full_messages=full_messages)
             
@@ -866,6 +869,8 @@ def main():
     parser.add_argument("--infonce", action="store_true", help="When set, Use InfoNCE loss.")
     parser.add_argument("--same_flop", action="store_true", help="When set, Use same number of flops per epoch.")
     parser.add_argument("--jepa_ratio", type=float, default=-1.0, help="When >0, randomly select this ratio of batches to apply JEPA. This implments Random JEPA-Loss Dropout (LD). If LD = alpha, jepa_ratio = 1 - alpha")
+    parser.add_argument("--use_default_data_collator", action="store_true", help="When set, Use `default_data_collator`.")
+    parser.add_argument("--unmask_assistant_special_tokens", action="store_true", help="When set, unmask assistant special tokens.")
 
     args = parser.parse_args()
     
@@ -924,7 +929,9 @@ def main():
             args.train_file, tokenizer, args.model_name,
             args.max_length, predictors=args.predictors, regular=args.regular,
             debug=args.debug, train_all=args.train_all, plain=args.plain,
-            front_pred=args.front_pred, reverse_pred=args.reverse_pred)
+            front_pred=args.front_pred, reverse_pred=args.reverse_pred,
+            unmask_assistant_special_tokens=args.unmask_assistant_special_tokens
+        )
         
         if args.eval_file:
             if torch.cuda.current_device() == 0:
@@ -933,7 +940,9 @@ def main():
                 args.eval_file, tokenizer, args.model_name,
                 args.max_length, regular=args.regular,
                 debug=args.debug, train_all=args.train_all, plain=args.plain,
-                front_pred=args.front_pred, reverse_pred=args.reverse_pred)
+                front_pred=args.front_pred, reverse_pred=args.reverse_pred,
+                unmask_assistant_special_tokens=args.unmask_assistant_special_tokens
+            )
         else:
             eval_dataset = None
             if torch.cuda.current_device() == 0:
@@ -947,7 +956,9 @@ def main():
             args.data_file, tokenizer, args.model_name,
             args.max_length, predictors=args.predictors, regular=args.regular,
             debug=args.debug, train_all=args.train_all, plain=args.plain,
-            front_pred=args.front_pred, reverse_pred=args.reverse_pred)
+            front_pred=args.front_pred, reverse_pred=args.reverse_pred,
+            unmask_assistant_special_tokens=args.unmask_assistant_special_tokens
+        )
 
         if args.eval_split > 0:
             split_dataset = full_dataset.train_test_split(

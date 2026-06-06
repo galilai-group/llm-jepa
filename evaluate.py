@@ -300,7 +300,7 @@ def format_conversation(messages, tokenizer, include_assistant=False, plain=Fals
     return formatted_text
 
 
-def generate_response(model, tokenizer, prompt, generation_config, max_new_tokens):
+def generate_response(model, tokenizer, prompt, generation_config, max_new_tokens, unmask_assistant_special_tokens=False):
     """Generate a single response"""
     
     # Tokenize input
@@ -308,7 +308,8 @@ def generate_response(model, tokenizer, prompt, generation_config, max_new_token
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=generation_config.max_length
+        max_length=generation_config.max_length,
+        add_special_tokens=not unmask_assistant_special_tokens
     )
     
     # Move to model device
@@ -343,14 +344,15 @@ def generate_response(model, tokenizer, prompt, generation_config, max_new_token
     return response
 
 
-def get_sequence_embedding(model, tokenizer, prompt, generation_config, pooling='last', layer=-1):
+def get_sequence_embedding(model, tokenizer, prompt, generation_config, pooling='last', layer=-1, unmask_assistant_special_tokens=False):
     """Get sequence embedding"""
     # Tokenize input
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=generation_config.max_length
+        max_length=generation_config.max_length,
+        add_special_tokens=not unmask_assistant_special_tokens
     )
     
     # Move to model device
@@ -420,12 +422,13 @@ def split_dataset_and_save(input_file, train_file, test_file, test_size=0.2, see
     return train_file, test_file
 
 
-def relative_probability(model, tokenizer, prompt, max_length):
+def relative_probability(model, tokenizer, prompt, max_length, unmask_assistant_special_tokens=False):
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
         max_length=max_length,
+        add_special_tokens=not unmask_assistant_special_tokens
     )
     
     # Move to model device
@@ -520,7 +523,7 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
                     generation_config, spider_path, max_examples=None, skip_existing=True,
                     split_tune_untune=False, start_index=1, layer=-1, pooling="last",
                     debug=0, similarity=False, startswith=False, max_new_tokens=128, t_sne=False,
-                    plain=False, t_sne_type=None, model_name=None):
+                    plain=False, t_sne_type=None, model_name=None, unmask_assistant_special_tokens=False):
     """Process dataset and generate responses"""
     
     # Load dataset
@@ -580,10 +583,12 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
                 if similarity:
                     input = get_user_messages(original_model_name, messages)
                     input_prompt = format_conversation(input, tokenizer, similarity=similarity, plain=plain)
-                    input_embedding = get_sequence_embedding(model, tokenizer, input_prompt, generation_config, layer=layer, pooling=pooling)
+                    input_embedding = get_sequence_embedding(model, tokenizer, input_prompt, generation_config,
+                                                             layer=layer, pooling=pooling, unmask_assistant_special_tokens=unmask_assistant_special_tokens)
                     output = get_assistant_messages(original_model_name, messages)
                     output_prompt = format_conversation(output, tokenizer, include_assistant=True, similarity=similarity, plain=plain)
-                    output_embedding = get_sequence_embedding(model, tokenizer, output_prompt, generation_config, layer=layer, pooling=pooling)
+                    output_embedding = get_sequence_embedding(model, tokenizer, output_prompt, generation_config,
+                                                              layer=layer, pooling=pooling, unmask_assistant_special_tokens=unmask_assistant_special_tokens)
 
                     if debug == 3:
                         print(f"INPUT: {input_prompt}")
@@ -618,14 +623,16 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
                     full_messages = get_messages(original_model_name, messages)
                     prompt = format_conversation(full_messages, tokenizer, plain=plain)
                     if input_file.startswith("hellaswag"):
-                        generated_response = relative_probability(model, tokenizer, prompt, max_length=generation_config.max_new_tokens)
+                        generated_response = relative_probability(model, tokenizer, prompt, max_length=generation_config.max_new_tokens,
+                                                                  unmask_assistant_special_tokens=unmask_assistant_special_tokens)
                         if debug == 6:
                             print(f"<<< {prompt}")
                             print(f"=== {messages[2]['content']}")
                             print(f">>> {generated_response}")
                             exit(0)
                     else:
-                        generated_response = generate_response(model, tokenizer, prompt, generation_config, max_new_tokens)
+                        generated_response = generate_response(model, tokenizer, prompt, generation_config, max_new_tokens,
+                                                               unmask_assistant_special_tokens)
                     # if generated_response == messages[2]["content"]:
                     # equal = (generated_response == messages[2]["content"])
                     # if startswith:
@@ -727,6 +734,8 @@ def main():
     parser.add_argument("--startswith", action="store_true", help="Wither to report match if generated starts with ground-truth.")
     parser.add_argument("--plain", action="store_true", help="When set, do not apply chat format, and append `<|perception|>` to the prompt.")
     parser.add_argument("--spider_path", type=str, default="", help="Path to spider databases.")
+    parser.add_argument("--unmask_assistant_special_tokens", action="store_true", help="When set, unmask assistant special tokens. Should match the training configuration.")
+
     
     args = parser.parse_args()
     
@@ -849,6 +858,7 @@ def main():
             t_sne_type=args.t_sne_type,
             plain=args.plain,
             model_name=args.model_name,
+            unmask_assistant_special_tokens=args.unmask_assistant_special_tokens
         )
         
         all_results[split_name] = results
