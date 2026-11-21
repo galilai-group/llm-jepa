@@ -575,7 +575,13 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
 
     # Set pad token
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        # Do not reuse EOS as pad: DataCollatorForLanguageModeling masks every label equal to
+        # pad_token_id, so the genuine EOS/EOT targets would never be trained (issues #9, #10).
+        if "<|finetune_right_pad_id|>" in tokenizer.vocab:  # reserved, unused Llama 3 token
+            tokenizer.pad_token = "<|finetune_right_pad_id|>"
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            new_tokens.append("<|pad|>")
     
     # Load model with better device mapping for multi-GPU
     device_map = None
